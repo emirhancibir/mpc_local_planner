@@ -1,0 +1,7 @@
+<library path="lib/libmpc_local_planner">
+  <class name="mpc_local_planner/MPCPlanner"
+         type="mpc_local_planner::MPCPlanner"
+         base_class_type="nav_core::BaseLocalPlanner">
+    <description>CasADi tabanlı MPC local planner</description>
+  </class>
+</library>
