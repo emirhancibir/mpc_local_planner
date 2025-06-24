@@ -7,13 +7,14 @@ This package implements a **Model Predictive Control (MPC)** based local planner
 ## TODO
 
 ### Core Functionality
-- [ ] change goal_reached function
+- [x] Change goal_reached function to be FSM-aware
 - [ ] Improve heading error calculation to reduce oscillations near the goal
 - [ ] Incorporate obstacle cost into the MPC cost function using costmap values
 
 ## Features
 
 * Implements nonlinear MPC using CasADi and IPOPT
+* FSM = TRACK, ROTATE, STOP
 * Optimizes over forward velocity `v` and angular velocity `w`
 * Penalizes:
 
