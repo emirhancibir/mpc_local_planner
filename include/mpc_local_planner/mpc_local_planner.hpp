@@ -1,7 +1,8 @@
 // include/mpc_local_planner/mpc_planner.hpp
 
 #pragma once
-
+#include <iostream>
+#include <angles/angles.h>
 #include <ros/ros.h>
 #include <nav_core/base_local_planner.h>
 #include <geometry_msgs/Twist.h>
@@ -21,6 +22,14 @@ namespace mpc_local_planner {
     public:
     MPCPlanner();
     ~MPCPlanner();
+    
+    enum class MPCState
+    {
+        TRACK,
+        ROTATE_GOAL,
+        STOP
+    };
+
 
     void initialize(std::string name, tf2_ros::Buffer* tf,
                     costmap_2d::Costmap2DROS* costmap_ros) override;
@@ -28,8 +37,14 @@ namespace mpc_local_planner {
     bool computeVelocityCommands(geometry_msgs::Twist& cmd_vel) override;
     bool isGoalReached() override;
     bool setPlan(const std::vector<geometry_msgs::PoseStamped>& plan) override;
+    bool rotateGoal(geometry_msgs::Twist& cmd_vel);
+    bool mpcCalculator(geometry_msgs::Twist& cmd_vel);
+    void updateObstaclePoints();
 
     private:
+    MPCState state_;
+    std::vector<std::pair<double, double>> obstacle_points_;
+
     bool initialized_;
     tf2_ros::Buffer* tf_;
     costmap_2d::Costmap2DROS* costmap_ros_;

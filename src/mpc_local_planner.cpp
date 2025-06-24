@@ -7,7 +7,7 @@ using namespace casadi;
 PLUGINLIB_EXPORT_CLASS(mpc_local_planner::MPCPlanner, nav_core::BaseLocalPlanner)
 namespace mpc_local_planner {
 
-  MPCPlanner::MPCPlanner() : initialized_(false), N_(20), dt_(0.1), opti_() {}
+  MPCPlanner::MPCPlanner() : initialized_(false), N_(20), dt_(0.1), opti_(), state_(MPCState::TRACK) {}
 
   MPCPlanner::~MPCPlanner() {}
 
@@ -30,12 +30,77 @@ namespace mpc_local_planner {
 
   bool MPCPlanner::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan) {
     global_plan_ = plan;
+    state_ = MPCState::TRACK; 
     return true;
   }
 
-  bool MPCPlanner::isGoalReached() {
-    return global_plan_.empty();
+  bool MPCPlanner::isGoalReached()
+  {
+    if (global_plan_.empty()) return false;
+    if (state_ == MPCState::STOP){
+      return true;
+      ROS_INFO("Goal Reached!");
+    }
+
+    geometry_msgs::PoseStamped pose;
+    if (!costmap_ros_->getRobotPose(pose)) {
+      ROS_WARN("Robot pozisyonu alinamadi");
+      return false;
+    }
+
+    geometry_msgs::PoseStamped goal = global_plan_.back();
+
+    double dx = goal.pose.position.x - pose.pose.position.x;
+    double dy = goal.pose.position.y - pose.pose.position.y;
+    double dist_to_goal = std::hypot(dx, dy);
+
+    double goal_yaw = tf2::getYaw(goal.pose.orientation);
+    double robot_yaw = tf2::getYaw(pose.pose.orientation);
+    double yaw_diff = angles::shortest_angular_distance(robot_yaw, goal_yaw);
+
+    const double position_tolerance = 0.1;  // metre
+    const double yaw_tolerance = 0.1;       // rad
+
+    if (dist_to_goal < position_tolerance && std::abs(yaw_diff) < yaw_tolerance) 
+    {
+      ROS_INFO("Goal Reached!");
+      return true;
+    }
+
+    return false;
   }
+
+
+  bool MPCPlanner::rotateGoal(geometry_msgs::Twist& cmd_vel)
+  {
+    geometry_msgs::PoseStamped pose;
+    if (!costmap_ros_->getRobotPose(pose)) {
+      ROS_WARN("Robot pozisyonu alinamadi");
+      return false;
+    }
+
+    geometry_msgs::PoseStamped goal = global_plan_.back();
+
+    double goal_yaw = tf2::getYaw(goal.pose.orientation);
+    double robot_yaw = tf2::getYaw(pose.pose.orientation);
+
+    double yaw_diff = angles::shortest_angular_distance(robot_yaw, goal_yaw);
+
+    const double yaw_tolerance = 0.05;
+    const double max_rot_speed = 0.3;
+    const double k_rot = 1.0; // P kontrol kazancı
+
+    if (std::abs(yaw_diff) < yaw_tolerance) {
+      cmd_vel.angular.z = 0.0;
+      return true;
+    }
+
+    cmd_vel.linear.x = 0.0;
+    double clamped_rot = std::max(-max_rot_speed, std::min(k_rot * yaw_diff, max_rot_speed));
+    cmd_vel.angular.z = clamped_rot;
+    return true;
+  }
+
 
   void MPCPlanner::setupOptimizer() {
     opti_ = casadi::Opti();
@@ -52,27 +117,34 @@ namespace mpc_local_planner {
       MX x_next = dynamics(X_(Slice(), k), U_(Slice(), k));
       opti_.subject_to(X_(Slice(), k + 1) == x_next);
     }
-
     MX cost = 0;
     for (int k = 0; k < N_; ++k) {
       MX pos_err = X_(Slice(0, 2), k) - Ref_(Slice(), k);
-      MX angle_to_goal = atan2(Ref_(1, k) - X_(1, k), Ref_(0, k) - X_(0, k));
-      MX heading_error = angle_to_goal - X_(2, k);
-      // normalize
-      heading_error = heading_error - 2*M_PI * floor((heading_error + M_PI)/(2*M_PI));
 
-      cost += MX::dot(pos_err, pos_err)
-              + 0.1 * MX::dot(U_(Slice(), k), U_(Slice(), k))
-              + 0.05 * heading_error * heading_error;
+      cost += MX::dot(pos_err, pos_err) + 0.1 * MX::dot(U_(Slice(), k), U_(Slice(), k));
+    }
+
+    for (const auto& obs : obstacle_points_)
+    {
+      MX dx = X_(0, k) - obs.first;
+      MX dy = X_(1, k) - obs.second;
+      MX dist_sq = dx*dx + dy*dy;
+      cost += 0.5 / (dist_sq + 1e-2);
     }
 
 
     opti_.minimize(cost);
 
-    opti_.subject_to(opti_.bounded(0.0, U_(0, Slice()), 0.5));   // v ileri
+    opti_.subject_to(opti_.bounded(-0.9, U_(0, Slice()), 0.9));   // v ileri
     opti_.subject_to(opti_.bounded(-0.4, U_(1, Slice()), 0.4));  // w bound
 
-    opti_.solver("ipopt");
+    Dict opts_dict;
+    opts_dict["ipopt.print_level"] = 0;
+    opts_dict["ipopt.sb"] = "yes";
+    opts_dict["print_time"] = 0;
+
+    opti_.solver("ipopt", opts_dict);
+
   }
 
   MX MPCPlanner::dynamics(const MX& x, const MX& u) {
@@ -83,10 +155,35 @@ namespace mpc_local_planner {
     return x_next;
   }
 
-  bool MPCPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
-    if (global_plan_.size() < N_) {
+  void MPCPlanner::updateObstaclePoints()
+  {
+    obstacle_points_.clear();
+
+    unsigned int size_x = costmap_->getSizeInCellsX();
+    unsigned int size_y = costmap_->getSizeInCellsY();
+    double resolution = costmap_->getResolution();
+    double origin_x = costmap_->getOriginX();
+    double origin_y = costmap_->getOriginY();
+
+    for (unsigned int mx = 0; mx < size_x; ++mx) {
+      for (unsigned int my = 0; my < size_y; ++my) {
+        unsigned char cost = costmap_->getCost(mx, my);
+        if (cost >= costmap_2d::LETHAL_OBSTACLE) {
+          double wx = origin_x + mx * resolution;
+          double wy = origin_y + my * resolution;
+          obstacle_points_.emplace_back(wx, wy);
+        }
+      }
+    }
+  }
+
+
+  bool MPCPlanner::mpcCalculator(geometry_msgs::Twist& cmd_vel)
+  {
+     if (global_plan_.size() < N_) {
       ROS_WARN("Global plan kisa: %lu < %d", global_plan_.size(), N_);
-      return false;
+      N_ = global_plan_.size();
+      // return false;
     }
 
     geometry_msgs::PoseStamped pose;
@@ -100,6 +197,7 @@ namespace mpc_local_planner {
     double theta = tf2::getYaw(pose.pose.orientation);
 
     opti_.set_value(X0_, casadi::DM({x, y, theta}));
+    updateObstaclePoints();
 
     int start_idx = 0;
     double min_dist = 1e9;
@@ -134,10 +232,67 @@ namespace mpc_local_planner {
 
       return true;
     } catch (std::exception& e) {
-      ROS_WARN("MPC çözümü başarısız: %s", e.what());
+      ROS_WARN("MPC cannot solve: %s", e.what());
       return false;
     }
   }
+  
+  bool MPCPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
+  {
+    if (global_plan_.empty()) {
+      ROS_WARN_THROTTLE(1.0, "Global plan bos.");
+      return false;
+    }
+
+    geometry_msgs::PoseStamped pose;
+    if (!costmap_ros_->getRobotPose(pose)) {
+      ROS_WARN("Robot pozisyonu alinamadi");
+      return false;
+    }
+
+    geometry_msgs::PoseStamped goal = global_plan_.back();
+    double dx = goal.pose.position.x - pose.pose.position.x;
+    double dy = goal.pose.position.y - pose.pose.position.y;
+    double dist_to_goal = std::hypot(dx, dy);
+    double goal_yaw = tf2::getYaw(goal.pose.orientation);
+    double robot_yaw = tf2::getYaw(pose.pose.orientation);
+    double yaw_diff = angles::shortest_angular_distance(robot_yaw, goal_yaw);
+
+    const double position_tolerance = 0.1;
+    const double yaw_tolerance = 0.1;
+
+    // FSM LOGIC
+    switch (state_) {
+      case MPCState::TRACK:
+
+        if (dist_to_goal < position_tolerance) {
+          ROS_INFO("Goal reached rotating....");
+          state_ = MPCState::ROTATE_GOAL;
+          return rotateGoal(cmd_vel); 
+        }
+        ROS_INFO("TRACKING MPC");
+        return mpcCalculator(cmd_vel);
+
+      case MPCState::ROTATE_GOAL:
+        if (std::abs(yaw_diff) < yaw_tolerance) {
+          ROS_INFO("stopped");
+          state_ = MPCState::STOP;
+          cmd_vel.linear.x = 0.0;
+          cmd_vel.angular.z = 0.0;
+          return true;
+        } else {
+          return rotateGoal(cmd_vel);
+        }
+
+      case MPCState::STOP:
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = 0.0;
+        return true;
+    }
+
+    return false;
+  }
+
 
 
 
