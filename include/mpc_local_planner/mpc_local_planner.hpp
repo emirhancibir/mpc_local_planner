@@ -12,6 +12,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <nav_msgs/Path.h>
 
 
 #include <casadi/casadi.hpp>
@@ -46,6 +47,7 @@ namespace mpc_local_planner {
     std::vector<std::pair<double, double>> obstacle_points_;
 
     bool initialized_;
+    double pos_weight = 1.0, obs_weight;
     tf2_ros::Buffer* tf_;
     costmap_2d::Costmap2DROS* costmap_ros_;
     costmap_2d::Costmap2D* costmap_;
@@ -60,14 +62,22 @@ namespace mpc_local_planner {
     casadi::MX X_, U_;
     casadi::MX X0_;      // Başlangıç durumu parametresi
     casadi::MX Ref_;     // Referans yol parametresi
+    casadi::MX Obs_;
+
 
     int N_;        // horizon length
     double dt_;    // time step
     casadi::Function dynamicsFunc_;
 
+    int max_obstacles_ = 50;
+
 
     void setupOptimizer();
     casadi::MX dynamics(const casadi::MX& x, const casadi::MX& u);
+    
+    // ros
+    ros::NodeHandle nh;
+    ros::Publisher mpc_path_pub_;
     };
 
 } // namespace mpc_local_planner

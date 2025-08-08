@@ -7,7 +7,7 @@ using namespace casadi;
 PLUGINLIB_EXPORT_CLASS(mpc_local_planner::MPCPlanner, nav_core::BaseLocalPlanner)
 namespace mpc_local_planner {
 
-  MPCPlanner::MPCPlanner() : initialized_(false), N_(20), dt_(0.1), opti_(), state_(MPCState::TRACK) {}
+  MPCPlanner::MPCPlanner() : initialized_(false), N_(150), dt_(0.1), opti_(), state_(MPCState::TRACK) {}
 
   MPCPlanner::~MPCPlanner() {}
 
@@ -24,6 +24,8 @@ namespace mpc_local_planner {
     ros::NodeHandle private_nh("~/" + name);
 
     setupOptimizer();
+
+    mpc_path_pub_ = nh.advertise<nav_msgs::Path>("/mpc_local_planner/mpc_path", 1);
 
     initialized_ = true;
   }
@@ -110,6 +112,8 @@ namespace mpc_local_planner {
 
     X0_ = opti_.parameter(3);       // Robotu start
     Ref_ = opti_.parameter(2, N_);
+    Obs_ = opti_.parameter(2, max_obstacles_);  // max_obstacles_: sabit sayı (örneğin 50)
+
 
     opti_.subject_to(X_(Slice(), 0) == X0_);
 
@@ -121,17 +125,19 @@ namespace mpc_local_planner {
     for (int k = 0; k < N_; ++k) {
       MX pos_err = X_(Slice(0, 2), k) - Ref_(Slice(), k);
 
-      cost += MX::dot(pos_err, pos_err) + 0.1 * MX::dot(U_(Slice(), k), U_(Slice(), k));
-    }
+      cost += MX::dot(pos_err, pos_err) * pos_weight + 0.1 * MX::dot(U_(Slice(), k), U_(Slice(), k));
+      // std::cout << "Engel oncesi costt : " << cost << std::endl;
+      for (int j = 0; j < max_obstacles_; ++j) {
+        MX dx = X_(0, k) - Obs_(0, j);
+        MX dy = X_(1, k) - Obs_(1, j);
+        MX dist_sq = dx*dx + dy*dy;
+        cost += log(1 + 1.0 / (dist_sq + 0.1));  // daha yumuşak alternatif
+        // std::cout << "Engel sonrasi costt : " << cost << std::endl;
 
-    for (const auto& obs : obstacle_points_)
-    {
-      MX dx = X_(0, k) - obs.first;
-      MX dy = X_(1, k) - obs.second;
-      MX dist_sq = dx*dx + dy*dy;
-      cost += 0.5 / (dist_sq + 1e-2);
+      }
     }
-
+    
+    
 
     opti_.minimize(cost);
 
@@ -157,6 +163,9 @@ namespace mpc_local_planner {
 
   void MPCPlanner::updateObstaclePoints()
   {
+    // std::cout << "update obsss "<< std::endl;
+    // costmap_ros_->updateMap();
+
     obstacle_points_.clear();
 
     unsigned int size_x = costmap_->getSizeInCellsX();
@@ -168,9 +177,12 @@ namespace mpc_local_planner {
     for (unsigned int mx = 0; mx < size_x; ++mx) {
       for (unsigned int my = 0; my < size_y; ++my) {
         unsigned char cost = costmap_->getCost(mx, my);
-        if (cost >= costmap_2d::LETHAL_OBSTACLE) {
+        // if (cost > 0)
+        //   std::cout << "cost: " << static_cast<int>(cost) << std::endl;
+        if (cost > 0) {
           double wx = origin_x + mx * resolution;
           double wy = origin_y + my * resolution;
+          // std::cout << " wx " << wx << "wy "<< wy << std::endl;
           obstacle_points_.emplace_back(wx, wy);
         }
       }
@@ -180,11 +192,11 @@ namespace mpc_local_planner {
 
   bool MPCPlanner::mpcCalculator(geometry_msgs::Twist& cmd_vel)
   {
-     if (global_plan_.size() < N_) {
-      ROS_WARN("Global plan kisa: %lu < %d", global_plan_.size(), N_);
-      N_ = global_plan_.size();
-      // return false;
-    }
+    //  if (global_plan_.size() < N_) {
+    //   ROS_WARN("Global plan kisa: %lu < %d", global_plan_.size(), N_);
+    //   N_ = global_plan_.size();
+    //   // return false;
+    // }
 
     geometry_msgs::PoseStamped pose;
     if (!costmap_ros_->getRobotPose(pose)) {
@@ -196,8 +208,36 @@ namespace mpc_local_planner {
     double y = pose.pose.position.y;
     double theta = tf2::getYaw(pose.pose.orientation);
 
+    double min_dist_to_obstacle = 1e9;
+    for (const auto& obs : obstacle_points_) {
+        double dx = obs.first - x;
+        double dy = obs.second - y;
+        double dist = std::hypot(dx, dy);
+        if (dist < min_dist_to_obstacle)
+            min_dist_to_obstacle = dist;
+    }
+
+    pos_weight = (min_dist_to_obstacle < 0.6) ? 0.05 : 1;
+
+
     opti_.set_value(X0_, casadi::DM({x, y, theta}));
-    updateObstaclePoints();
+    updateObstaclePoints();  
+
+    int n_obs = std::min((int)obstacle_points_.size(), max_obstacles_);
+    casadi::DM obs_matrix = casadi::DM::zeros(2, max_obstacles_);
+
+    for (int i = 0; i < n_obs; ++i) {
+      obs_matrix(0, i) = obstacle_points_[i].first;
+      obs_matrix(1, i) = obstacle_points_[i].second;
+    }
+
+    for (int i = n_obs; i < max_obstacles_; ++i) {
+      obs_matrix(0, i) = 9999;
+      obs_matrix(1, i) = 9999;
+    }
+
+    opti_.set_value(Obs_, obs_matrix);
+
 
     int start_idx = 0;
     double min_dist = 1e9;
@@ -229,6 +269,33 @@ namespace mpc_local_planner {
 
       cmd_vel.linear.x = v;
       cmd_vel.angular.z = w;
+
+      // Path Publishinggg /////////////////////////////////////////////////////////////////////////////
+      nav_msgs::Path path_msg;
+      path_msg.header.frame_id = global_frame_;
+      path_msg.header.stamp = ros::Time::now();
+
+      casadi::DM sol_X = sol.value(X_);
+
+      for (int k = 0; k <= N_; ++k) {
+        geometry_msgs::PoseStamped pose;
+        pose.header = path_msg.header;
+        pose.pose.position.x = static_cast<double>(sol_X(0, k));
+        pose.pose.position.y = static_cast<double>(sol_X(1, k));
+        pose.pose.position.z = 0.0;
+
+        double theta = static_cast<double>(sol_X(2, k));
+        tf2::Quaternion q;
+        q.setRPY(0, 0, theta);
+        pose.pose.orientation = tf2::toMsg(q);
+
+        path_msg.poses.push_back(pose);
+      }
+
+      mpc_path_pub_.publish(path_msg);
+      /////////////////////////////////////////////////////////////////////
+
+
 
       return true;
     } catch (std::exception& e) {
